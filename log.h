@@ -49,6 +49,7 @@ void infomsg(const char *msg, ...);
 void warningmsg(const char *msg, ...);
 void errormsg(const char *msg, ...);
 void fatal(const char *msg, ...);
+void printmsg(const char *msg, ...);
 
 
 #endif

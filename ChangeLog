@@ -1,3 +1,24 @@
+20141227:
+- added option --pid to print PID of current process
+- updated usage to include option -W
+- man page formatting fixes
+- configure updates
+- support compiling on systems that do not define PATH_MAX
+
+20140310:
+- added memory advise for buffer memory
+- compatibility fix for Solars st driver
+- prevent buffer overflow attack via defaults file
+- ignore defaults file from other users
+- updated documentation for use with cron
+- minor bugfixes
+
+20140126:
+- new feature: set option defaults in ~/.mbuffer.rc
+- enhancement: write status to the log file
+- enhancement: added option to suppress status logging
+- fix: formatting fix for summary message
+
 20130220:
 - reverted incorrect fix for -P 100, which may lead to data corruption
 - reenable hash libraries (no correlation with data corruption)

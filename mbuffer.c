@@ -1,5 +1,5 @@
 /*
- *  Copyright (C) 2000-2013, Thomas Maier-Komor
+ *  Copyright (C) 2000-2014, Thomas Maier-Komor
  *
  *  This is the source code of mbuffer.
  *
@@ -58,14 +58,6 @@ typedef int caddr_t;
 #ifdef HAVE_SENDFILE_H
 #include <sys/sendfile.h>
 #endif
-/* if this sendfile implementation does not support sending from buffers,
-   disable sendfile support */
-	#ifndef SFV_FD_SELF
-	#ifdef __GNUC__
-	#warning sendfile is unable to send from buffers
-	#endif
-	#undef HAVE_SENDFILE
-	#endif
 #endif
 
 #ifndef EBADRQC
@@ -122,6 +114,15 @@ static MD5_CTX MD5ctxt;
 #include "network.h"
 #include "log.h"
 
+/* if this sendfile implementation does not support sending from buffers,
+   disable sendfile support */
+	#ifndef SFV_FD_SELF
+	#ifdef __GNUC__
+	#warning sendfile is unable to send from buffers
+	#endif
+	#undef HAVE_SENDFILE
+	#endif
+
 char
 	*Prefix;
 int 
@@ -132,11 +133,10 @@ size_t
 static pthread_t
 	Reader, Watchdog;
 static long
-	Tmp = -1, Pause = 0, Memmap = 0,
-	Status = 1, Outblocksize = 0,
-	Autoload_time = 0, OptSync = 0;
+	Tmp = -1,
+	OptSync = 0;
 static unsigned long
-	Outsize = 10240;
+	Outsize = 10240, Pause = 0, Timeout = 0;
 static volatile int
 	Terminate = 0,	/* abort execution, because of error or signal */
 	EmptyCount = 0,	/* counter incremented when buffer runs empty */
@@ -145,7 +145,8 @@ static volatile int
 	Done = 0,
 	MainOutOK = 1;	/* is the main outputThread still writing or just coordinating senders */
 static unsigned long long
-	Blocksize = 10240, MaxReadSpeed = 0, MaxWriteSpeed = 0, OutVolsize = 0;
+	Totalmem = 0, PgSz = 0, NumP = 0, Blocksize = 10240,
+	MaxReadSpeed = 0, MaxWriteSpeed = 0, OutVolsize = 0;
 static volatile unsigned long long
 	Rest = 0, Numin = 0, Numout = 0;
 static double
@@ -153,9 +154,12 @@ static double
 static char
 	*Tmpfile = 0, **Buffer;
 static const char
-	*Infile = 0, *Autoload_cmd = 0;
+	*Infile = 0, *AutoloadCmd = 0;
+static unsigned int
+	AutoloadTime = 0;
 static int
 	Memlock = 0, TermQ[2],
+	Memmap = 0, Quiet = 0, Status = 1, StatusLog = 1,
 	Hashers = 0, Direct = 0, SetOutsize = 0;
 static long
 	NumVolumes = 1,		/* number of input volumes, 0 for interactive prompting */
@@ -263,18 +267,17 @@ static void summary(unsigned long long numb, int numthreads)
 	m = (int) (secs - h * 3600)/60;
 	secs -= m * 60 + h * 3600;
 	if (numthreads > 1)
-		msg += sprintf(msg,"summary: %d x ",numthreads);
+		msg += sprintf(msg,"summary: %dx ",numthreads);
 	else
 		msg += sprintf(msg,"summary: ");
 	msg += kb2str(msg,numb);
 	msg += sprintf(msg,"Byte in ");
 	if (h > 0)
-		msg += sprintf(msg,"%d h %02d min ",h,m);
-	else if (m > 0) {
-		msg += sprintf(msg,"%2d min ",m);
-		msg += sprintf(msg,"%04.1f sec - average of ",secs);
-	} else
-		msg += sprintf(msg,"%4.1f sec - average of ",secs);
+		msg += sprintf(msg,"%dh %02dmin %04.1fsec - average of ",h,m,secs);
+	else if (m > 0)
+		msg += sprintf(msg,"%2dmin %04.1fsec - average of ",m,secs);
+	else
+		msg += sprintf(msg,"%4.1fsec - average of ",secs);
 	msg += kb2str(msg,av);
 	msg += sprintf(msg,"B/s");
 	if (EmptyCount != 0)
@@ -350,12 +353,11 @@ static int mt_usleep(unsigned long sleep_usecs)
 
 
 
-static void *watchdogThread(void *timeout)
+static void *watchdogThread(void *ignored)
 {
 	unsigned long ni = Numin, no = Numout;
-	unsigned t = (unsigned) timeout;
 	for (;;) {
-		sleep(t);
+		sleep(Timeout);
 		if ((ni == Numin) && (Finish == -1)) {
 			errormsg("watchdog timeout: input stalled; sending SIGINT\n");
 			kill(getpid(),SIGINT);
@@ -406,7 +408,7 @@ static void statusThread(void)
  	}
 	while (!Done) {
 		int err,numsender;
-		ssize_t nw;
+		ssize_t nw = 0;
 		char buf[256], *b = buf;
 
  		timeout.tv_sec = 0;
@@ -450,17 +452,21 @@ static void statusThread(void)
 			b += sprintf(b,"B/s, ");
 		b += kb2str(b,total);
 		b += sprintf(b,"B total, buffer %3.0f%% full",fill);
+		if (Quiet == 0) {
 #ifdef NEED_IO_INTERLOCK
-		if (Log == STDERR_FILENO) {
-			int e;
-			e = pthread_mutex_lock(&LogMut);
-			assert(e == 0);
-			nw = write(STDERR_FILENO,buf,strlen(buf));
-			e = pthread_mutex_unlock(&LogMut);
-			assert(e == 0);
-		} else
+			if (Log == STDERR_FILENO) {
+				int e;
+				e = pthread_mutex_lock(&LogMut);
+				assert(e == 0);
+				nw = write(STDERR_FILENO,buf,strlen(buf));
+				e = pthread_mutex_unlock(&LogMut);
+				assert(e == 0);
+			} else
 #endif
-			nw = write(STDERR_FILENO,buf,strlen(buf));
+				nw = write(STDERR_FILENO,buf,strlen(buf));
+		}
+		if ((StatusLog != 0) && (Log != STDERR_FILENO))
+			infomsg("%s\n",buf+1);
 		err = pthread_mutex_unlock(&TermMut);
 		assert(0 == err);
 		if (nw == -1)	/* stop trying to print status messages after a write error */
@@ -611,8 +617,8 @@ static int requestInputVolume(unsigned at, unsigned num)
 	do {
 		if ((Autoloader) && (Infile)) {
 			int ret;
-			if (Autoload_cmd) {
-				cmd = Autoload_cmd;
+			if (AutoloadCmd) {
+				cmd = AutoloadCmd;
 			} else {
 				(void) snprintf(cmd_buf, sizeof(cmd_buf), "mt -f %s offline", Infile);
 				cmd = cmd_buf;
@@ -628,9 +634,9 @@ static int requestInputVolume(unsigned at, unsigned num)
 				Terminate = 1;
 				pthread_exit((void *) -1);
 			}
-			if (Autoload_time) {
+			if (AutoloadTime) {
 				infomsg("waiting for drive to get ready...\n");
-				(void) sleep(Autoload_time);
+				(void) sleep(AutoloadTime);
 			}
 		} else {
 			if (0 == promptInteractive(at,num))
@@ -1043,7 +1049,7 @@ static int requestOutputVolume(int out, const char *outfile)
 		if (Autoloader) {
 			const char default_cmd[] = "mt -f %s offline";
 			char cmd_buf[sizeof(default_cmd)+strlen(outfile)];
-			const char *cmd = Autoload_cmd;
+			const char *cmd = AutoloadCmd;
 			int err;
 
 			if (cmd == 0) {
@@ -1061,9 +1067,9 @@ static int requestOutputVolume(int out, const char *outfile)
 				Autoloader = 0;
 				return -1;
 			}
-			if (Autoload_time) {
+			if (AutoloadTime) {
 				infomsg("waiting for drive to get ready...\n");
-				(void) sleep(Autoload_time);
+				(void) sleep(AutoloadTime);
 			}
 		} else {
 			int err;
@@ -1105,29 +1111,6 @@ static int requestOutputVolume(int out, const char *outfile)
 	if (Terminal && ! Autoloader) {
 		char msg[] = "\nOK - continuing...\n";
 		(void) write(STDERR_FILENO,msg,sizeof(msg));
-	}
-	return out;
-}
-
-
-
-static int checkIncompleteOutput(int out, const char *outfile)
-{
-	static unsigned long mulretry = 0;	/* well this isn't really good design,
-					   but better than a global variable */
-	
-	debugmsg("Outblocksize = %ld, mulretry = %lu\n",Outblocksize,mulretry);
-	if ((0 != mulretry) || (0 == Outblocksize)) {
-		out = requestOutputVolume(out,outfile);
-		debugmsg("resetting outputsize to normal\n");
-		if (0 != mulretry) {
-			Outsize = mulretry;
-			mulretry = 0;
-		}
-	} else {
-		debugmsg("setting to new outputsize (end of device)\n");
-		mulretry = Outsize;
-		Outsize = Outblocksize;
 	}
 	return out;
 }
@@ -1283,6 +1266,7 @@ static void *outputThread(void *arg)
 		}
 		do {
 			/* use Outsize which could be the blocksize of the device (option -d) */
+			unsigned long long n = rest > Outsize ? Outsize : rest;
 			int num;
 			if (haderror) {
 				if (NumSenders == 0)
@@ -1292,7 +1276,6 @@ static void *outputThread(void *arg)
 #ifdef HAVE_SENDFILE
 			if (sendout) {
 				off_t baddr = (off_t) (Buffer[at] + blocksize - rest);
-				unsigned long long n = SetOutsize ? (rest > Outsize ? (rest/Outsize)*Outsize : rest) : rest;
 				num = sendfile(out,SFV_FD_SELF,&baddr,n);
 				debugiomsg("outputThread: sendfile(%d, SFV_FD_SELF, &(Buffer[%d] + %llu), %llu) = %d\n", out, at, blocksize - rest, n, num);
 				if ((num == -1) && ((errno == EOPNOTSUPP) || (errno == EINVAL))) {
@@ -1303,17 +1286,18 @@ static void *outputThread(void *arg)
 			} else
 #endif
 			{
-				num = write(out,Buffer[at] + blocksize - rest, rest > Outsize ? Outsize : rest);
-				debugiomsg("outputThread: writing %lld@0x%p: ret = %d\n",rest > Outsize ? Outsize : rest,Buffer[at] + blocksize - rest,num);
+				num = write(out,Buffer[at] + blocksize - rest, n);
+				debugiomsg("outputThread: writing %lld@0x%p: ret = %d\n", n, Buffer[at] + blocksize - rest, num);
 			}
-			if ((-1 == num) && (Terminal||Autoloader) && ((errno == ENOMEM) || (errno == ENOSPC))) {
-				/* request a new volume - but first check
-				 * whether we are really at the
-				 * end of the device */
-				out = checkIncompleteOutput(out,dest->name);
-				if (out == -1)
-					haderror = 1;
-				continue;
+			if (Terminal||Autoloader) {
+				if (((-1 == num) && ((errno == ENOMEM) || (errno == ENOSPC)))
+					|| (0 == num)) {
+					/* request a new volume */
+					out = requestOutputVolume(out,dest->name);
+					if (out == -1)
+						haderror = 1;
+					continue;
+				}
 			} else if (-1 == num) {
 				dest->result = strerror(errno);
 				errormsg("outputThread: error writing to %s at offset 0x%llx: %s\n",dest->arg,(long long)Blocksize*Numout+blocksize-rest,strerror(errno));
@@ -1371,8 +1355,8 @@ static void *outputThread(void *arg)
 static void version(void)
 {
 	(void) fprintf(stderr,
-		"mbuffer version "VERSION"\n"\
-		"Copyright 2001-2011 - T. Maier-Komor\n"\
+		"mbuffer version "PACKAGE_VERSION"\n"\
+		"Copyright 2001-2014 - T. Maier-Komor\n"\
 		"License: GPLv3 - see file LICENSE\n"\
 		"This program comes with ABSOLUTELY NO WARRANTY!!!\n"
 		"Donations via PayPal to thomas@maier-komor.de are welcome and support this work!\n"
@@ -1427,6 +1411,7 @@ static void usage(void)
 		"-A <cmd>   : issue command <cmd> to request new volume\n"
 		"-v <level> : set verbose level to <level> (valid values are 0..6)\n"
 		"-q         : quiet - do not display the status on stderr\n"
+		"-Q         : quiet - do not log the status\n"
 		"-c         : write with synchronous data integrity support\n"
 		"-e         : stop processing on any kind of error\n"
 #ifdef O_DIRECT
@@ -1436,10 +1421,13 @@ static void usage(void)
 		"-H\n"
 		"--md5      : generate md5 hash of transfered data\n"
 		"--hash <a> : use alogritm <a>, if <a> is 'list' possible algorithms are listed\n"
+		"--pid      : print PID of this instance\n"
+		"-W <time>  : set watchdog timeout to <time> seconds\n"
 #endif
 		"-4         : force use of IPv4\n"
 		"-6         : force use of IPv6\n"
 		"-0         : use IPv4 or IPv6\n"
+		"--tcpbuffer: size for TCP buffer\n"
 		"-V\n"
 		"--version  : print version information\n"
 		"Unsupported buffer options: -t -Z -B\n"
@@ -1609,12 +1597,255 @@ static void openDestinationFiles(dest_t *d)
 		fatal("unable to open all outputs\n");
 }
 
+
+
+static const char *calcval(const char *arg, unsigned long long *res)
+{
+	char ch;
+	double d;
+	
+	switch (sscanf(arg,"%lf%c",&d,&ch)) {
+	default:
+		assert(0);
+		break;
+	case 2:
+		if (d <= 0)
+			return "negative value out of range";
+		switch (ch) {
+		case 'k':
+		case 'K':
+			d *= 1024.0;
+			*res = d;
+			return 0;
+		case 'm':
+		case 'M':
+			d *= 1024.0*1024.0;
+			*res = d;
+			return 0;
+		case 'g':
+		case 'G':
+			d *= 1024.0*1024.0*1024.0;
+			*res = d;
+			return 0;
+		case 't':
+		case 'T':
+			d *= 1024.0*1024.0*1024.0*1024.0;
+			*res = d;
+			return 0;
+		case '%':
+			if ((d >= 90) || (d <= 0))
+				return "invalid value for percentage (must be 0..90)";
+			*res = d;
+			return 0;
+		case 'b':
+		case 'B':
+			if (d < 128)
+				return "invalid value for number of bytes";
+			*res = d;
+			return 0;
+		default:
+			return "invalid dimension";
+		}
+	case 1:
+		if (d <= 0)
+			return "value out of range";
+		if (d <= 100)
+			return "value out of range";
+		*res = d;
+		return 0;
+	case 0:
+		break;
+	}
+	return "unrecognized argument";
+}
+
+
+static void initDefaults()
+{
+#ifdef PATH_MAX
+	char dfname[PATH_MAX+1];
+#else
+	char dfname[1024];
+#endif
+	char line[256];
+	const char *home = getenv("HOME");
+	size_t l;
+	int df;
+	FILE *dfstr;
+	struct stat st;
+
+	if (home == 0) {
+		warningmsg("HOME environment variable not set - unable to find defaults file\n");
+		return;
+	}
+	strncpy(dfname,home,sizeof(dfname)-1);
+	dfname[sizeof(dfname)-1] = 0;
+	l = strlen(dfname);
+	if (l + 12 > PATH_MAX) {
+		warningmsg("path to defaults file breaks PATH_MAX\n");
+		return;
+	}
+	strcat(dfname,"/.mbuffer.rc");
+	df = open(dfname,O_RDONLY);
+	if (df == -1) {
+		if (errno == ENOENT)
+			infomsg("no defaults file ~/.mbuffer.rc\n");
+		else
+			warningmsg("error opening defaults file %s: %s\n",dfname,strerror(errno));
+		return;
+	}
+	if (-1 == fstat(df,&st)) {
+		warningmsg("unable to stat defaults file %s: %s\n",dfname,strerror(errno));
+		close(df);
+		return;
+	}
+	if (getuid() != st.st_uid) {
+		warningmsg("ignoring defaults file from different user\n");
+		close(df);
+		return;
+	}
+	infomsg("reading defaults file %s\n",dfname);
+	dfstr = fdopen(df,"r");
+	assert(dfstr);
+	while (!feof(dfstr)) {
+		char key[64],valuestr[64];
+		fscanf(dfstr,"%255[^\n]\n",line);
+		char *pound = strchr(line,'#');
+		unsigned long long value;
+		int a;
+
+		if (pound)
+			*pound = 0;
+		a = sscanf(line,"%63[A-Za-z]%*[ \t=:]%63[0-9a-zA-Z]",key,valuestr);
+		if (a != 2) {
+			warningmsg("unable to parse line '%s' in .mbuffer.rc; %d arguments\n",line,a);
+			continue;
+		}
+		debugmsg("parsing key/value pair %s=%s\n",key,valuestr);
+		if (strcasecmp(key,"numblocks") == 0) {
+			long nb = strtol(valuestr,0,0);
+			if ((nb == 0) && (errno == EINVAL)) {
+				warningmsg("invalid argument for %s: \"%s\"\n",key,valuestr);
+			} else {
+				Numblocks = nb;
+				debugmsg("Numblocks = %llu\n",Numblocks);
+			}
+		} else if (strcasecmp(key,"pause") == 0) {
+			long p = strtol(valuestr,0,0);
+			if ((p == 0) && (errno == EINVAL)) {
+				warningmsg("invalid argument for %s: \"%s\"\n",key,valuestr);
+			} else {
+				Pause = p;
+				debugmsg("Pause = %d\n",Pause);
+			}
+		} else if (strcasecmp(key,"autoloadtime") == 0) {
+			long at = strtol(valuestr,0,0) - 1;
+			if ((at == 0) && (errno == EINVAL)) 
+				warningmsg("invalid argument for %s: \"%s\"\n",key,valuestr);
+			else {
+				AutoloadTime = at;
+				debugmsg("Autoloader time = %d\n",AutoloadTime);
+			}
+		} else if (strcasecmp(key,"startread") == 0) {
+			double sr = 0;
+			if (1 == sscanf(valuestr,"%lf",&sr))
+				sr /= 100;
+			if ((sr <= 1) && (sr > 0)) {
+				StartRead = sr;
+				debugmsg("StartRead = %1.2lf\n",StartRead);
+			}
+		} else if (strcasecmp(key,"startwrite") == 0) {
+			double sw = 0;
+			if (1 == sscanf(valuestr,"%lf",&sw))
+				sw /= 100;
+			if ((sw <= 1) && (sw > 0)) {
+				StartWrite = sw;
+				debugmsg("StartWrite = %1.2lf\n",StartWrite);
+			}
+		} else if (strcasecmp(key,"timeout") == 0) {
+			long t = strtol(valuestr,0,0);
+			if (((t == 0) && (errno == EINVAL)) || (t < 0)) 
+				warningmsg("invalid argument for %s: \"%s\"\n",key,valuestr);
+			else {
+				Timeout = t;
+				debugmsg("Timeout = %lu\n",Timeout);
+			}
+		} else if (strcasecmp(key,"showstatus") == 0) {
+			if ((strcasecmp(valuestr,"yes") == 0) || (strcasecmp(valuestr,"on") == 0) || (strcmp(valuestr,"1") == 0)) {
+				Quiet = 0;
+				debugmsg("showstatus = yes\n");
+			} else if ((strcasecmp(valuestr,"no") == 0) || (strcasecmp(valuestr,"off") == 0) || (strcmp(valuestr,"0") == 0)) {
+				Quiet = 1;
+				debugmsg("showstatus = no\n");
+			} else 
+				warningmsg("invalid argument for %s: \"%s\"\n",key,valuestr);
+			continue;
+		} else if (strcasecmp(key,"logstatus") == 0) {
+			if ((strcasecmp(valuestr,"yes") == 0) || (strcasecmp(valuestr,"on") == 0) || (strcmp(valuestr,"1") == 0)) {
+				StatusLog = 1;
+				debugmsg("logstatus = yes\n");
+			} else if ((strcasecmp(valuestr,"no") == 0) || (strcasecmp(valuestr,"off") == 0) || (strcmp(valuestr,"0") == 0)) {
+				StatusLog = 0;
+				debugmsg("logstatus = no\n");
+			} else 
+				warningmsg("invalid argument for %s: \"%s\"\n",key,valuestr);
+			continue;
+		} else if (strcasecmp(key,"memlock") == 0) {
+			if ((strcasecmp(valuestr,"yes") == 0) || (strcasecmp(valuestr,"on") == 0) || (strcmp(valuestr,"1") == 0)) {
+				Memlock = 1;
+				debugmsg("Memlock = %lu\n",Memlock);
+			} else if ((strcasecmp(valuestr,"no") == 0) || (strcasecmp(valuestr,"off") == 0) || (strcmp(valuestr,"0") == 0)) {
+				Memlock = 0;
+				debugmsg("Memlock = %lu\n",Memlock);
+			} else 
+				warningmsg("invalid argument for %s: \"%s\"\n",key,valuestr);
+			continue;
+		} else if (strcasecmp(key,"printpid") == 0) {
+			if ((strcasecmp(valuestr,"yes") == 0) || (strcasecmp(valuestr,"on") == 0) || (strcmp(valuestr,"1") == 0)) {
+				printmsg("PID is %d\n",getpid());
+			} else if ((strcasecmp(valuestr,"no") == 0) || (strcasecmp(valuestr,"off") == 0) || (strcmp(valuestr,"0") == 0)) {
+			} else 
+				warningmsg("invalid argument for %s: \"%s\"\n",key,valuestr);
+			continue;
+		}
+		const char *argerror = calcval(valuestr,&value);
+		if (argerror) {
+			warningmsg("ignoring key/value pair from defaults file (%s = %s): %s\n",key,valuestr,argerror);
+			continue;
+		}
+		if (strcasecmp(key,"blocksize") == 0) {
+			Blocksize = value;
+		} else if (strcasecmp(key,"maxwritespeed") == 0) {
+			MaxWriteSpeed = value;
+		} else if (strcasecmp(key,"maxreadspeed") == 0) {
+			MaxReadSpeed = value;
+		} else if (strcasecmp(key,"Totalmem") == 0) {
+			if (value < 100) {
+#if defined(_SC_AVPHYS_PAGES) && defined(_SC_PAGESIZE) && !defined(__CYGWIN__) || defined(__FreeBSD__)
+				Totalmem = ((unsigned long long) NumP * PgSz * value) / 100 ;
+				debugmsg("Totalmem = %lluk\n",Totalmem>>10);
+#else
+				warningmsg("Unable to determine page size or amount of available memory - please specify an absolute amount of memory.\n");
+#endif
+			}
+		} else if (strcasecmp(key,"tcpbuffer") == 0) {
+			TCPBufSize = value;
+		} else {
+			warningmsg("unknown key: %s\n",key);
+			continue;
+		}
+		infomsg("setting %s to %lld\n",key,value);
+	}
+	fclose(dfstr);
+	close(df);
+}
+
+
 int main(int argc, const char **argv)
 {
-	unsigned long long totalmem = 0;
 	int optMset = 0, optSset = 0, optBset = 0, optMode = O_EXCL, numOut = 0;
 	int  numstdout = 0, numthreads = 0;
-	long mxnrsem, timeout = 0;
+	long mxnrsem;
 	int c, fl, err;
 	sigset_t       signalSet;
 #ifdef HAVE_STRUCT_STAT_ST_BLKSIZE
@@ -1626,33 +1857,56 @@ int main(int argc, const char **argv)
 	const char *outfile = 0;
 	struct sigaction sig;
 	dest_t *dest = 0;
-#if defined(_SC_AVPHYS_PAGES) && defined(_SC_PAGESIZE) && !defined(__CYGWIN__)
-	long long pgsz, nump;
 
-	TickTime = 1000000 / sysconf(_SC_CLK_TCK);
-	pgsz = sysconf(_SC_PAGESIZE);
-	assert(pgsz > 0);
-	nump = sysconf(_SC_AVPHYS_PAGES);
-	assert(nump > 0);
-	Blocksize = pgsz;
-	Numblocks = nump/50;
-#elif defined(__FreeBSD__)
-	size_t nump_size = sizeof(nump_size);
-	unsigned long pgsz,nump;
-	sysctlbyname("hw.availpages", &nump, &nump_size, NULL, 0);
-	pgsz = sysconf(_SC_PAGESIZE);
-	assert(pgsz > 0);
-#endif
-#if defined(_POSIX_MONOTONIC_CLOCK) && (_POSIX_MONOTONIC_CLOCK >= 0) && defined(CLOCK_MONOTONIC)
-	if (sysconf(_SC_MONOTONIC_CLOCK) > 0)
-		ClockSrc = CLOCK_MONOTONIC;
-#endif
+	/* setup logging prefix */
 	progname = basename(argv0);
 	PrefixLen = strlen(progname) + 2;
 	Prefix = malloc(PrefixLen);
 	(void) strcpy(Prefix,progname);
 	Prefix[PrefixLen - 2] = ':';
 	Prefix[PrefixLen - 1] = ' ';
+
+	/* set verbose level before parsing defaults and options */
+	for (c = 1; c < argc; c++) {
+		const char *arg = argv[c];
+		if ((arg[0] == '-') && (arg[1] == 'v')) {
+			long verb;
+			if (arg[2])
+				verb = strtol(arg+2,0,0);
+			else
+				verb = strtol(argv[++c],0,0);
+			if ((verb == 0) && (errno == EINVAL))
+				errormsg("invalid argument to option -v: \"%s\"\n",argv[c]);
+			else
+				Verbose = verb;
+			debugmsg("Verbose = %d\n",Verbose);
+		}
+	}
+	
+	/* gather system parameters */
+	TickTime = 1000000 / sysconf(_SC_CLK_TCK);
+#if defined(_SC_AVPHYS_PAGES) && defined(_SC_PAGESIZE) && !defined(__CYGWIN__)
+	PgSz = sysconf(_SC_PAGESIZE);
+	assert(PgSz > 0);
+	NumP = sysconf(_SC_AVPHYS_PAGES);
+	assert(NumP > 0);
+	Blocksize = PgSz;
+	debugmsg("total # of phys pages: %li (pagesize %li)\n",NumP,PgSz);
+	Numblocks = NumP/50;
+#elif defined(__FreeBSD__)
+	size_t nump_size = sizeof(nump_size);
+	sysctlbyname("hw.availpages", &NumP, &nump_size, NULL, 0);
+	PgSz = sysconf(_SC_PAGESIZE);
+	assert(PgSz > 0);
+#endif
+#if defined(_POSIX_MONOTONIC_CLOCK) && (_POSIX_MONOTONIC_CLOCK >= 0) && defined(CLOCK_MONOTONIC)
+	if (sysconf(_SC_MONOTONIC_CLOCK) > 0)
+		ClockSrc = CLOCK_MONOTONIC;
+#endif
+
+	/* setup parameters */
+	initDefaults();
+	debugmsg("default buffer set to %d blocks of %lld bytes\n",Numblocks,Blocksize);
 	for (c = 1; c < argc; c++) {
 		if (!argcheck("-s",argv,&c,argc)) {
 			Blocksize = Outsize = calcint(argv,c,Blocksize);
@@ -1667,16 +1921,16 @@ int main(int argc, const char **argv)
 			optMode |= O_TRUNC;
 			debugmsg("truncate next file\n");
 		} else if (!argcheck("-m",argv,&c,argc)) {
-			totalmem = calcint(argv,c,totalmem);
+			Totalmem = calcint(argv,c,Totalmem);
 			optMset = 1;
-			if (totalmem < 100) {
+			if (Totalmem < 100) {
 #if defined(_SC_AVPHYS_PAGES) && defined(_SC_PAGESIZE) && !defined(__CYGWIN__) || defined(__FreeBSD__)
-				totalmem = ((unsigned long long) nump * pgsz * totalmem) / 100 ;
+				Totalmem = ((unsigned long long) NumP * PgSz * Totalmem) / 100 ;
 #else
 				fatal("Unable to determine page size or amount of available memory - please specify an absolute amount of memory.\n");
 #endif
 			}
-			debugmsg("totalmem = %lluk\n",totalmem>>10);
+			debugmsg("Totalmem = %lluk\n",Totalmem>>10);
 		} else if (!argcheck("-b",argv,&c,argc)) {
 			long nb = strtol(argv[c],0,0);
 			if ((nb == 0) && (errno == EINVAL)) {
@@ -1697,19 +1951,7 @@ int main(int argc, const char **argv)
 			fatal("cannot determine blocksize of device (unsupported by OS)\n");
 #endif
 		} else if (!argcheck("-v",argv,&c,argc)) {
-			int verb;
-			if (c == argc)
-				fatal("missing argument for option -v\n");
-			verb = strtol(argv[c],0,0);
-			if ((verb == 0) && (errno == EINVAL))
-				errormsg("invalid argument to option -v: \"%s\"\n",argv[c]);
-			else
-				Verbose = verb;
-			debugmsg("Verbose = %d\n",Verbose);
-#if defined(_SC_AVPHYS_PAGES) && defined(_SC_PAGESIZE) && !defined(__CYGWIN__)
-			debugmsg("total # of phys pages: %li (pagesize %li)\n",nump,pgsz);
-#endif
-			debugmsg("default buffer set to %d blocks of %lld bytes\n",Numblocks,Blocksize);
+			/* has been parsed already */
 		} else if (!argcheck("-u",argv,&c,argc)) {
 
 			long p = strtol(argv[c],0,0);
@@ -1812,7 +2054,10 @@ int main(int argc, const char **argv)
 			debugmsg("overwrite = 1\n");
 		} else if (!strcmp("-q",argv[c])) {
 			debugmsg("disabling display of status\n");
-			Status = 0;
+			Quiet = 1;
+		} else if (!strcmp("-Q",argv[c])) {
+			debugmsg("disabling logging of status\n");
+			StatusLog = 0;
 		} else if (!strcmp("-c",argv[c])) {
 			debugmsg("enabling full synchronous I/O\n");
 			OptSync = O_SYNC;
@@ -1825,15 +2070,13 @@ int main(int argc, const char **argv)
 				errormsg("invalid argument to option -a: \"%s\"\n",argv[c]);
 			else {
 				Autoloader = 1;
-				Autoload_time = at;
+				AutoloadTime = at;
 			}
-			if (at && timeout && timeout <= Autoload_time)
-				fatal("autoload time must be smaller than watchdog timeout\n");
-			debugmsg("Autoloader time = %d\n",Autoload_time);
+			debugmsg("Autoloader time = %d\n",AutoloadTime);
 		} else if (!argcheck("-A",argv,&c,argc)) {
 			Autoloader = 1;
-			Autoload_cmd = argv[c];
-			debugmsg("Autoloader command = \"%s\"\n", Autoload_cmd);
+			AutoloadCmd = argv[c];
+			debugmsg("Autoloader command = \"%s\"\n", AutoloadCmd);
 		} else if (!argcheck("-P",argv,&c,argc)) {
 			if (1 != sscanf(argv[c],"%lf",&StartWrite))
 				StartWrite = 0;
@@ -1857,10 +2100,10 @@ int main(int argc, const char **argv)
 			warning("POSIX memory locking is unsupported on this system.\n");
 #endif
 		} else if (!argcheck("-W",argv,&c,argc)) {
-			timeout = strtol(argv[c],0,0);
-			if (timeout <= 0)
+			Timeout = strtol(argv[c],0,0);
+			if (Timeout <= 0)
 				fatal("invalid argument to option -W\n");
-			if (timeout <= Autoload_time)
+			if (Timeout <= AutoloadTime)
 				fatal("timeout must be bigger than autoload time\n");
 		} else if (!strcmp("--direct",argv[c])) {
 #ifdef O_DIRECT
@@ -1905,6 +2148,8 @@ int main(int argc, const char **argv)
 			fatal("hash calculation support has not been compiled in!\n");
 #endif
 			addHashAlgorithm(argv[c]);
+		} else if (!strcmp("--pid",argv[c])) {
+			printmsg("PID is %d\n",getpid());
 		} else if (!argcheck("-D",argv,&c,argc)) {
 			OutVolsize = calcint(argv,c,0);
 			debugmsg("OutVolsize = %llu\n",OutVolsize);
@@ -1913,20 +2158,22 @@ int main(int argc, const char **argv)
 	}
 
 	/* consistency check for options */
+	if (AutoloadTime && Timeout && Timeout <= AutoloadTime)
+		fatal("autoload time must be smaller than watchdog timeout\n");
 	if (optBset&optSset&optMset) {
-		if (Numblocks * Blocksize != totalmem)
+		if (Numblocks * Blocksize != Totalmem)
 			fatal("inconsistent options: blocksize * number of blocks != totalsize!\n");
 	} else if (((!optBset)&optSset&optMset) || (optMset&(!optBset)&(!optSset))) {
-		if (totalmem <= Blocksize)
+		if (Totalmem <= Blocksize)
 			fatal("total memory must be larger than block size\n");
-		Numblocks = totalmem / Blocksize;
-		infomsg("Numblocks = %llu, Blocksize = %llu, totalmem = %llu\n",(unsigned long long)Numblocks,(unsigned long long)Blocksize,(unsigned long long)totalmem);
+		Numblocks = Totalmem / Blocksize;
+		infomsg("Numblocks = %llu, Blocksize = %llu, Totalmem = %llu\n",(unsigned long long)Numblocks,(unsigned long long)Blocksize,(unsigned long long)Totalmem);
 	} else if (optBset&!optSset&optMset) {
 		if (Blocksize == 0)
 			fatal("blocksize must be greater than 0\n");
-		if (totalmem <= Blocksize)
+		if (Totalmem <= Blocksize)
 			fatal("total memory must be larger than block size\n");
-		Blocksize = totalmem / Numblocks;
+		Blocksize = Totalmem / Numblocks;
 		infomsg("blocksize = %llu\n",(unsigned long long)Blocksize);
 	}
 	if ((StartRead < 1) && (StartWrite > 0))
@@ -1935,7 +2182,7 @@ int main(int argc, const char **argv)
 		fatal("multi-volume support is unsupported with multiple outputs\n");
 	if (Autoloader) {
 		if ((!outfile) && (!Infile))
-			fatal("Setting autoloader time without using a device doesn't make any sense!\n");
+			fatal("Setting autoloader time or command without using a device doesn't make any sense!\n");
 		if (outfile && Infile) {
 			fatal("Which one is your autoloader? Input or output? Replace input or output with a pipe.\n");
 		}
@@ -2026,6 +2273,10 @@ int main(int argc, const char **argv)
 		Buffer[0] = (char *) valloc(Blocksize * Numblocks);
 		if (Buffer[0] == 0)
 			fatal("Could not allocate enough memory (%lld requested): %s\n",(unsigned long long)Blocksize * Numblocks,strerror(errno));
+#ifdef MADV_DONTFORK
+		if (-1 == madvise(Buffer[0],Blocksize * Numblocks, MADV_DONTFORK))
+			warningmsg("unable to advise memory handling of buffer: %s\n",strerror(errno));
+#endif
 	}
 	for (c = 1; c < Numblocks; c++) {
 		Buffer[c] = Buffer[0] + Blocksize * c;
@@ -2097,7 +2348,7 @@ int main(int argc, const char **argv)
 	}
 
 	debugmsg("checking if we have a controlling terminal...\n");
-	sig.sa_sigaction = SIG_IGN;
+	sig.sa_handler = SIG_IGN;
 	err = sigaction(SIGTTIN,&sig,0);
 	assert(err == 0);
 	fl = fcntl(STDERR_FILENO,F_GETFL);
@@ -2107,7 +2358,7 @@ int main(int argc, const char **argv)
 		int tty = open("/dev/tty",O_RDWR);
 		if (-1 == tty) {
 			Terminal = 0;
-			if (Autoloader == 0)
+			if ((Autoloader == 0) && (outfile))
 				warningmsg("No controlling terminal and no autoloader command specified.\n");
 		} else {
 			Terminal = 1;
@@ -2198,6 +2449,8 @@ int main(int argc, const char **argv)
 		   "This can result in incorrect written data when\n"
 		   "using multiple volumes. Continue at your own risk!\n");
 #endif
+	if (((Verbose < 4) || (StatusLog == 0)) && (Quiet != 0))
+		Status = 0;
 	if (Status) {
 		if (-1 == pipe(TermQ))
 			fatal("could not create termination pipe: %s\n",strerror(errno));
@@ -2207,8 +2460,8 @@ int main(int argc, const char **argv)
 	}
 	err = pthread_create(&dest->thread,0,&outputThread,dest);
 	assert(0 == err);
-	if (timeout) {
-		err = pthread_create(&Watchdog,0,&watchdogThread,(void*)timeout);
+	if (Timeout) {
+		err = pthread_create(&Watchdog,0,&watchdogThread,(void*)0);
 		assert(0 == err);
 	}
 	if (Status) {
@@ -2228,7 +2481,7 @@ int main(int argc, const char **argv)
 			assert(err == 1);
 		}
 	}
-	if (timeout) {
+	if (Timeout) {
 		err = pthread_cancel(Watchdog);
 		assert(err == 0);
 	}

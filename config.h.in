@@ -24,7 +24,7 @@
 #undef PACKAGE
 
 /* version of mbuffer */
-#undef VERSION
+#undef PACKAGE_VERSION
 
 /* Define if you want support for debugging messages. */
 #undef DEBUG
