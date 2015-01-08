@@ -84,7 +84,7 @@ AC_STRUCT_ST_BLKSIZE
 
 AC_HEADER_ASSERT
 AC_CHECK_LIB(pthread, pthread_mutex_init)
-AC_SEARCH_LIBS(clock_gettime,rt,,AC_MSG_ERROR(could not find the library containing clock_gettime!))
+#AC_SEARCH_LIBS(clock_gettime,rt,,AC_MSG_ERROR(could not find the library containing clock_gettime!))
 AC_SEARCH_LIBS(sem_init,rt posix,,AC_MSG_ERROR(could not find semaphore functions!))
 AC_SEARCH_LIBS(rint,m,,AC_MSG_ERROR(unable to find rint))
 AC_SEARCH_LIBS(seteuid,c,AC_DEFINE(HAVE_SETEUID),)

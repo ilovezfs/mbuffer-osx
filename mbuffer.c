@@ -164,9 +164,6 @@ static long
 static long long
 	TickTime = 0;
 
-static clockid_t
-	ClockSrc = CLOCK_REALTIME;
-
 #ifdef __sun
 #include <synch.h>
 #define sem_t sema_t
@@ -209,6 +206,14 @@ static volatile int SendSize = 0, ActSenders = 0;
 #undef assert
 #define assert(x) ((x) || (*(char *) 0 = 1))
 #endif
+
+#ifdef __APPLE__
+#include <mbuffer_darwin.h>
+#endif
+
+static clockid_t
+	ClockSrc = CLOCK_REALTIME;
+
 
 
 
